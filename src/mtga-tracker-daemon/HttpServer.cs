@@ -8,6 +8,7 @@ using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using System.Linq;
 using Microsoft.Data.Sqlite;
 
 using HackF5.UnitySpy;
@@ -305,6 +306,53 @@ namespace MTGATrackerDaemon
                         responseJSON = $"{{\"error\":\"{JsonEscape(ex.ToString())}\"}}";
                     }
                 }
+                else if (request.Url.AbsolutePath.StartsWith("/explore"))
+                {
+                    try
+                    {
+                        DateTime startTime = DateTime.Now;
+                        IAssemblyImage assemblyImage = CreateAssemblyImage();
+                        
+                        // Parse path parameter from query string
+                        string path = request.QueryString["path"] ?? "";
+                        string[] pathParts = string.IsNullOrEmpty(path) ? new string[0] : path.Split('|');
+                        
+                        // Navigate to the specified path
+                        object currentObject = assemblyImage;
+                        string currentPath = "";
+                        
+                        foreach (string part in pathParts)
+                        {
+                            if (!string.IsNullOrEmpty(part))
+                            {
+                                currentObject = GetObjectProperty(currentObject, part);
+                                currentPath += (string.IsNullOrEmpty(currentPath) ? "" : "|") + part;
+                            }
+                        }
+                        
+                        string htmlResponse = GenerateExplorerHTML(currentObject, currentPath, request.Url.Authority);
+                        
+                        TimeSpan ts = (DateTime.Now - startTime);
+                        
+                        // Return HTML instead of JSON for this endpoint
+                        byte[] htmlData = Encoding.UTF8.GetBytes(htmlResponse);
+                        response.AddHeader("Access-Control-Allow-Origin", "*");
+                        response.AddHeader("Access-Control-Allow-Methods", "*");
+                        response.AddHeader("Access-Control-Allow-Headers", "*");
+                        
+                        response.ContentType = "text/html";
+                        response.ContentEncoding = Encoding.UTF8;
+                        response.ContentLength64 = htmlData.LongLength;
+                        
+                        await response.OutputStream.WriteAsync(htmlData, 0, htmlData.Length);
+                        response.Close();
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        responseJSON = $"{{\"error\":\"{JsonEscape(ex.ToString())}\"}}";
+                    }
+                }
             }        
 
             // Write the response info
@@ -320,6 +368,284 @@ namespace MTGATrackerDaemon
             // Write out to the response stream (asynchronously), then close it
             await response.OutputStream.WriteAsync(data, 0, data.Length);
             response.Close();
+        }
+
+        private object GetObjectProperty(object obj, string propertyName)
+        {
+            if (obj == null) return null;
+            
+            if (obj is IAssemblyImage assemblyImage)
+            {
+                return assemblyImage[propertyName];
+            }
+            else if (obj is ITypeDefinition typeDef)
+            {
+                // For type definitions, try to get static fields or instance fields
+                try
+                {
+                    // First try to get as static field value
+                    return typeDef.GetStaticValue<object>(propertyName);
+                }
+                catch
+                {
+                    // If that fails, try to find an instance of this class and access the field from it
+                    try
+                    {
+                        // Look for common singleton patterns
+                        object instance = null;
+                        
+                        // Try to find Instance, _instance, instance fields
+                        var instanceFieldNames = new[] { "Instance", "_instance", "instance", "<Instance>k__BackingField" };
+                        foreach (var instanceFieldName in instanceFieldNames)
+                        {
+                            try
+                            {
+                                instance = typeDef.GetStaticValue<object>(instanceFieldName);
+                                if (instance != null) break;
+                            }
+                            catch { }
+                        }
+                        
+                        // If we found an instance, try to access the property from it
+                        if (instance is IManagedObjectInstance managedInstance)
+                        {
+                            return managedInstance[propertyName];
+                        }
+                    }
+                    catch { }
+                    
+                    // If all else fails, return the field definition for info
+                    var field = typeDef.Fields.FirstOrDefault(f => f.Name == propertyName);
+                    return field;
+                }
+            }
+            else if (obj is IManagedObjectInstance managedObj)
+            {
+                return managedObj[propertyName];
+            }
+            else if (obj.GetType().IsArray)
+            {
+                Array array = (Array)obj;
+                if (int.TryParse(propertyName, out int index) && index >= 0 && index < array.Length)
+                {
+                    return array.GetValue(index);
+                }
+            }
+            
+            return null;
+        }
+
+        private string GenerateExplorerHTML(object currentObject, string currentPath, string authority)
+        {
+            StringBuilder html = new StringBuilder();
+            html.Append("<!DOCTYPE html><html><head><title>MTGA Memory Explorer</title>");
+            html.Append("<style>body{font-family:Arial,sans-serif;margin:20px;} .path{background:#f0f0f0;padding:10px;margin-bottom:20px;} ");
+            html.Append(".property{margin:5px 0;} .clickable{color:blue;text-decoration:underline;cursor:pointer;} ");
+            html.Append(".value{color:green;} .type{color:gray;font-style:italic;} .back{margin-bottom:20px;}</style></head><body>");
+            
+            html.Append("<h1>MTGA Memory Explorer</h1>");
+            
+            // Current path display
+            html.Append($"<div class='path'><strong>Current Path:</strong> {(string.IsNullOrEmpty(currentPath) ? "Root" : currentPath.Replace("|", " → "))}</div>");
+            
+            // Back button
+            if (!string.IsNullOrEmpty(currentPath))
+            {
+                string[] pathParts = currentPath.Split('|');
+                string parentPath = string.Join("|", pathParts.Take(pathParts.Length - 1));
+                html.Append($"<div class='back'><a href='http://{authority}/explore?path={Uri.EscapeDataString(parentPath)}'>← Back</a></div>");
+            }
+            
+            html.Append("<div class='properties'>");
+            
+            try
+            {
+                if (currentObject is IAssemblyImage assemblyImage)
+                {
+                    html.Append("<h3>Assembly Image Properties:</h3>");
+                    foreach (var typeDef in assemblyImage.TypeDefinitions)
+                    {
+                        string newPath = string.IsNullOrEmpty(currentPath) ? typeDef.Name : currentPath + "|" + typeDef.Name;
+                        html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(newPath)}'>{HtmlEscape(typeDef.Name)}</a> <span class='type'>(Type)</span></div>");
+                    }
+                }
+                else if (currentObject is ITypeDefinition typeDefinition)
+                {
+                    html.Append("<h3>Type Fields:</h3>");
+                    foreach (var fieldDef in typeDefinition.Fields)
+                    {
+                        try
+                        {
+                            string newPath = string.IsNullOrEmpty(currentPath) ? fieldDef.Name : currentPath + "|" + fieldDef.Name;
+                            
+                            // Try to determine if this is a static field or instance field
+                            string fieldInfo = fieldDef.TypeInfo.IsStatic ? " (Static)" : " (Instance)";
+                            string typeName = fieldDef.TypeInfo.TryGetTypeDefinition(out var typeDef) ? typeDef.Name : fieldDef.TypeInfo.TypeCode.ToString();
+                            
+                            if (fieldDef.TypeInfo.IsStatic)
+                            {
+                                // For static fields, we can potentially navigate to them
+                                string linkPath = GetSmartNavigationPath(newPath, fieldDef.Name);
+                                html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>{HtmlEscape(fieldDef.Name)}</a> <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span></div>");
+                            }
+                            else
+                            {
+                                // For instance fields, make them clickable too - we'll try to access them from any available instance
+                                string linkPath = GetSmartNavigationPath(newPath, fieldDef.Name);
+                                html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>{HtmlEscape(fieldDef.Name)}</a> <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span></div>");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            html.Append($"<div class='property'>{HtmlEscape(fieldDef.Name)}: <span style='color:red'>Error: {HtmlEscape(ex.Message)}</span></div>");
+                        }
+                    }
+                }
+                else if (currentObject is IManagedObjectInstance managedObj)
+                {
+                    html.Append("<h3>Object Properties:</h3>");
+                    foreach (var fieldDef in managedObj.TypeDefinition.Fields)
+                    {
+                        try
+                        {
+                            var value = managedObj[fieldDef.Name];
+                            string newPath = string.IsNullOrEmpty(currentPath) ? fieldDef.Name : currentPath + "|" + fieldDef.Name;
+                            
+                            if (value != null && (value is IManagedObjectInstance || value.GetType().IsArray))
+                            {
+                                string linkPath = GetSmartNavigationPath(newPath, fieldDef.Name);
+                                html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>{HtmlEscape(fieldDef.Name)}</a> <span class='type'>({HtmlEscape(value.GetType().Name)})</span></div>");
+                            }
+                            else
+                            {
+                                string valueStr = value?.ToString() ?? "null";
+                                if (valueStr.Length > 100) valueStr = valueStr.Substring(0, 100) + "...";
+                                string typeName = fieldDef.TypeInfo.TryGetTypeDefinition(out var typeDef) ? typeDef.Name : fieldDef.TypeInfo.TypeCode.ToString();
+                                html.Append($"<div class='property'>{HtmlEscape(fieldDef.Name)}: <span class='value'>{HtmlEscape(valueStr)}</span> <span class='type'>({HtmlEscape(typeName)})</span></div>");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            html.Append($"<div class='property'>{HtmlEscape(fieldDef.Name)}: <span style='color:red'>Error: {HtmlEscape(ex.Message)}</span></div>");
+                        }
+                    }
+                }
+                else if (currentObject is IFieldDefinition fieldDefinition)
+                {
+                    html.Append("<h3>Field Definition:</h3>");
+                    html.Append($"<div class='property'>Name: <span class='value'>{HtmlEscape(fieldDefinition.Name)}</span></div>");
+                    string typeName = fieldDefinition.TypeInfo.TryGetTypeDefinition(out var typeDef) ? typeDef.Name : fieldDefinition.TypeInfo.TypeCode.ToString();
+                    html.Append($"<div class='property'>Type: <span class='value'>{HtmlEscape(typeName)}</span></div>");
+                    html.Append($"<div class='property'>Is Static: <span class='value'>{fieldDefinition.TypeInfo.IsStatic}</span></div>");
+                    html.Append($"<div class='property'>Is Constant: <span class='value'>{fieldDefinition.TypeInfo.IsConstant}</span></div>");
+                    html.Append($"<div class='property'>Declaring Type: <span class='value'>{HtmlEscape(fieldDefinition.DeclaringType.FullName)}</span></div>");
+                }
+                else if (currentObject != null && currentObject.GetType().IsArray)
+                {
+                    Array array = (Array)currentObject;
+                    html.Append($"<h3>Array Elements (Length: {array.Length}):</h3>");
+                    
+                    int maxDisplay = Math.Min(array.Length, 50); // Limit display to first 50 elements
+                    for (int i = 0; i < maxDisplay; i++)
+                    {
+                        try
+                        {
+                            var element = array.GetValue(i);
+                            string newPath = string.IsNullOrEmpty(currentPath) ? i.ToString() : currentPath + "|" + i.ToString();
+                            
+                            if (element != null && (element is IManagedObjectInstance || element.GetType().IsArray))
+                            {
+                                html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(newPath)}'>[{i}]</a> <span class='type'>({HtmlEscape(element.GetType().Name)})</span></div>");
+                            }
+                            else
+                            {
+                                string valueStr = element?.ToString() ?? "null";
+                                if (valueStr.Length > 100) valueStr = valueStr.Substring(0, 100) + "...";
+                                html.Append($"<div class='property'>[{i}]: <span class='value'>{HtmlEscape(valueStr)}</span></div>");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            html.Append($"<div class='property'>[{i}]: <span style='color:red'>Error: {HtmlEscape(ex.Message)}</span></div>");
+                        }
+                    }
+                    
+                    if (array.Length > maxDisplay)
+                    {
+                        html.Append($"<div class='property'><em>... and {array.Length - maxDisplay} more elements</em></div>");
+                    }
+                }
+                else
+                {
+                    html.Append($"<div class='property'>Value: <span class='value'>{HtmlEscape(currentObject?.ToString() ?? "null")}</span></div>");
+                    html.Append($"<div class='property'>Type: <span class='type'>{HtmlEscape(currentObject?.GetType().Name ?? "null")}</span></div>");
+                    html.Append($"<div class='property'>Full Type: <span class='type'>{HtmlEscape(currentObject?.GetType().FullName ?? "null")}</span></div>");
+                    
+                    // If it's a managed object instance, try to show its properties
+                    if (currentObject is IManagedObjectInstance debugManagedObj)
+                    {
+                        html.Append("<h3>Debug - Object Properties:</h3>");
+                        foreach (var field in debugManagedObj.TypeDefinition.Fields)
+                        {
+                            try
+                            {
+                                var value = debugManagedObj[field.Name];
+                                string valueStr = value?.ToString() ?? "null";
+                                if (valueStr.Length > 100) valueStr = valueStr.Substring(0, 100) + "...";
+                                string newPath = string.IsNullOrEmpty(currentPath) ? field.Name : currentPath + "|" + field.Name;
+                                
+                                if (value != null && (value is IManagedObjectInstance || value.GetType().IsArray))
+                                {
+                                    html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(newPath)}'>{HtmlEscape(field.Name)}</a> <span class='type'>({HtmlEscape(value.GetType().Name)})</span></div>");
+                                }
+                                else
+                                {
+                                    html.Append($"<div class='property'>{HtmlEscape(field.Name)}: <span class='value'>{HtmlEscape(valueStr)}</span></div>");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                html.Append($"<div class='property'>{HtmlEscape(field.Name)}: <span style='color:red'>Error: {HtmlEscape(ex.Message)}</span></div>");
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                html.Append($"<div style='color:red'>Error exploring object: {HtmlEscape(ex.Message)}</div>");
+            }
+            
+            html.Append("</div></body></html>");
+            return html.ToString();
+        }
+
+        private string GetSmartNavigationPath(string fullPath, string fieldName)
+        {
+            // Smart navigation for common patterns
+            // fullPath already contains currentPath + "|" + fieldName
+            
+            // When clicking on managers from WrapperController's Instance, add the manager's Instance automatically
+            if (fullPath.StartsWith("WrapperController|<Instance>k__BackingField|") && fieldName.EndsWith("k__BackingField"))
+            {
+                if (fieldName.Contains("Manager") || fieldName.Contains("Client") || fieldName.Contains("Database"))
+                {
+                    return fullPath + "|<Instance>k__BackingField";
+                }
+            }
+            
+            // Return the path as-is for other cases
+            return fullPath;
+        }
+
+        private string HtmlEscape(string text)
+        {
+            if (text == null) return "null";
+            return text.Replace("&", "&amp;")
+                      .Replace("<", "&lt;")
+                      .Replace(">", "&gt;")
+                      .Replace("\"", "&quot;")
+                      .Replace("'", "&#39;");
         }
 
         private IAssemblyImage CreateAssemblyImage()
