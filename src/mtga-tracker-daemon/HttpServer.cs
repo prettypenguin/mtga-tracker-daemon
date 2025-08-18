@@ -20,6 +20,7 @@ using ICSharpCode.SharpZipLib.GZip;
 using ICSharpCode.SharpZipLib.Tar;
 
 using Newtonsoft.Json;
+using MTGATrackerDaemon.Controllers;
 
 namespace MTGATrackerDaemon
 {
@@ -32,6 +33,18 @@ namespace MTGATrackerDaemon
         private Version currentVersion;
 
         private bool updating = false;
+
+        // Controllers
+        private StatusController statusController;
+        private CardsController cardsController;
+        private AllCardsController allCardsController;
+        private PlayerController playerController;
+        private InventoryController inventoryController;
+        private EventsController eventsController;
+        private MatchStateController matchStateController;
+        private ExplorerController explorerController;
+        private ShutdownController shutdownController;
+        private UpdatesController updatesController;
             
         public void Start(string url)
         {
@@ -39,7 +52,10 @@ namespace MTGATrackerDaemon
             currentVersion = assembly.GetName().Version;
             Console.WriteLine($"Current version = {currentVersion}");
 
-            CheckForUpdates();
+            CheckForUpdatesInternal();
+
+            // Initialize controllers
+            InitializeControllers();
 
             // Create a Http server and start listening for incoming connections
             listener = new HttpListener();
@@ -53,6 +69,20 @@ namespace MTGATrackerDaemon
 
             // Close the listener
             listener.Close();
+        }
+
+        private void InitializeControllers()
+        {
+            statusController = new StatusController(this);
+            cardsController = new CardsController(this);
+            allCardsController = new AllCardsController(this);
+            playerController = new PlayerController(this);
+            inventoryController = new InventoryController(this);
+            eventsController = new EventsController(this);
+            matchStateController = new MatchStateController(this);
+            explorerController = new ExplorerController(this);
+            shutdownController = new ShutdownController(this);
+            updatesController = new UpdatesController(this);
         }
 
         private async Task HandleIncomingConnections()
@@ -82,276 +112,55 @@ namespace MTGATrackerDaemon
         private async Task HandleRequest(HttpListenerRequest request, HttpListenerResponse response) {
             string responseJSON = "{\"error\":\"unsupported request\"}";
 
-            // If `shutdown` url requested w/ POST, then shutdown the server after serving the page
+            // Handle POST requests
             if (request.HttpMethod == "POST")
             {
                 if (request.Url.AbsolutePath == "/shutdown")
                 {
-                    Console.WriteLine("Shutdown requested");
-                    responseJSON = "{\"result\":\"shutdown request accepted\"}";
-                    runServer = false;
+                    responseJSON = shutdownController.HandleRequest();
                 }
                 else if(request.Url.AbsolutePath == "/checkForUpdates")
                 {
-                    bool updatesAvailable = CheckForUpdates();
-                    responseJSON = $"{{\"updatesAvailable\":\"{updatesAvailable.ToString().ToLower()}\"}}";
+                    responseJSON = updatesController.HandleRequest();
                 }
             } 
+            // Handle GET requests
             else if (request.HttpMethod == "GET")
             {
                 if (request.Url.AbsolutePath == "/status")
                 {
-                    Process mtgaProcess = GetMTGAProcess();
-                    if (mtgaProcess == null)
-                    {
-                        responseJSON = $"{{\"isRunning\":\"false\", \"daemonVersion\":\"{currentVersion}\", \"updating\":\"{updating.ToString().ToLower()}\", \"processId\":-1}}";
-                    }
-                    else
-                    {
-                        responseJSON = $"{{\"isRunning\":\"true\", \"daemonVersion\":\"{currentVersion}\", \"updating\":\"{updating.ToString().ToLower()}\", \"processId\":{mtgaProcess.Id}}}";
-                    }
+                    responseJSON = statusController.HandleRequest();
                 }
                 else if (request.Url.AbsolutePath == "/cards")
                 {
-                    try
-                    {
-                        DateTime startTime = DateTime.Now;
-                        IAssemblyImage assemblyImage = CreateAssemblyImage();
-                        object[] cards = assemblyImage["WrapperController"]["<Instance>k__BackingField"]["<InventoryManager>k__BackingField"]["_inventoryServiceWrapper"]["<Cards>k__BackingField"]["_entries"];
-
-                        StringBuilder cardsArrayJSON = new StringBuilder("[");
-                        
-                        bool firstCard = true;
-                        for (int i = 0; i < cards.Length; i++)
-                        {
-                            if(cards[i] is ManagedStructInstance cardInstance)
-                            {
-                                int owned = cardInstance.GetValue<int>("value");
-                                if (owned > 0)
-                                {
-                                    if (firstCard)
-                                    {
-                                        firstCard = false;
-                                    }
-                                    else
-                                    {
-                                        cardsArrayJSON.Append(",");
-                                    }
-                                    uint groupId = cardInstance.GetValue<uint>("key");
-                                    cardsArrayJSON.Append($"{{\"grpId\":{groupId}, \"owned\":{owned}}}");
-                                }
-                            }
-                        }
-
-                        cardsArrayJSON.Append("]");
-
-                        TimeSpan ts = (DateTime.Now - startTime);
-                        responseJSON = $"{{ \"cards\":{cardsArrayJSON}, \"elapsedTime\":{(int)ts.TotalMilliseconds} }}";
-                    }                    
-                    catch (Exception ex)
-                    {
-                        responseJSON = $"{{\"error\":\"{ex.ToString()}\"}}";
-                    }      
+                    responseJSON = cardsController.HandleRequest();
                 }
                 else if (request.Url.AbsolutePath == "/playerId") 
                 {
-                    try
-                    {
-                        DateTime startTime = DateTime.Now;
-                        IAssemblyImage assemblyImage = CreateAssemblyImage();
-                        ManagedClassInstance accountInfo = (ManagedClassInstance) assemblyImage["WrapperController"]["<Instance>k__BackingField"]["<AccountClient>k__BackingField"]["<AccountInformation>k__BackingField"];
-
-                        string playerId = accountInfo.GetValue<string>("AccountID");
-                        string displayName = accountInfo.GetValue<string>("DisplayName");
-                        string personaId = accountInfo.GetValue<string>("PersonaID");
-                        TimeSpan ts = (DateTime.Now - startTime);
-                        responseJSON = $"{{ \"playerId\":\"{playerId}\", \"displayName\":\"{displayName}\", \"personaId\":\"{personaId}\", \"elapsedTime\":{(int)ts.TotalMilliseconds} }}";
-                    }                    
-                    catch (Exception ex)
-                    {
-                        responseJSON = $"{{\"error\":\"{ex.ToString()}\"}}";
-                    }
+                    responseJSON = playerController.HandleRequest();
                 }
                 else if (request.Url.AbsolutePath == "/inventory")
                 {
-                    try
-                    {
-                        DateTime startTime = DateTime.Now;
-                        IAssemblyImage assemblyImage = CreateAssemblyImage();
-                        var inventory = assemblyImage["WrapperController"]["<Instance>k__BackingField"]["<InventoryManager>k__BackingField"]["_inventoryServiceWrapper"]["m_inventory"];
-
-                        TimeSpan ts = (DateTime.Now - startTime);
-                        responseJSON = $"{{ \"gems\":{inventory["gems"]}, \"gold\":{inventory["gold"]}, \"elapsedTime\":{(int)ts.TotalMilliseconds} }}";
-                    }
-                    catch (Exception ex)
-                    {
-                        responseJSON = $"{{\"error\":\"{ex.ToString()}\"}}";
-                    }
+                    responseJSON = inventoryController.HandleRequest();
                 }
                 else if (request.Url.AbsolutePath == "/events")
                 {
-                    try
-                    {
-                        DateTime startTime = DateTime.Now;
-                        IAssemblyImage assemblyImage = CreateAssemblyImage();
-                        object[] events = assemblyImage["PAPA"]["_instance"]["_eventManager"]["_eventsServiceWrapper"]["_cachedEvents"]["_items"];
-
-                        StringBuilder eventsArrayJSON = new StringBuilder("[");
-                        
-                        bool firstEvent = true;
-                        for (int i = 0; i < events.Length; i++)
-                        {
-                            if(events[i] is ManagedClassInstance eventInstance)
-                            {
-                                string eventId = eventInstance.GetValue<string>("InternalEventName");
-                                if (firstEvent)
-                                {
-                                    firstEvent = false;
-                                }
-                                else
-                                {
-                                    eventsArrayJSON.Append(",");
-                                }
-                                eventsArrayJSON.Append($"\"{eventId}\"");
-                            }
-                        }
-                    
-                        eventsArrayJSON.Append("]");
-
-                        TimeSpan ts = (DateTime.Now - startTime);
-                        responseJSON = $"{{\"events\":{eventsArrayJSON},\"elapsedTime\":{(int)ts.TotalMilliseconds}}}";
-
-                    }
-                    catch (Exception ex)
-                    {
-                        responseJSON = $"{{\"error\":\"{ex.ToString()}\"}}";
-                    }
+                    responseJSON = eventsController.HandleRequest();
                 }
                 else if (request.Url.AbsolutePath == "/matchState")
                 {
-                    try
-                    {
-                        DateTime startTime = DateTime.Now;
-                        IAssemblyImage assemblyImage = CreateAssemblyImage();
-                        ManagedClassInstance matchManager = (ManagedClassInstance) assemblyImage["PAPA"]["_instance"]["_matchManager"];
-
-                        string matchId = matchManager.GetValue<string>("<MatchID>k__BackingField");
-
-                        ManagedClassInstance localPlayerInfo = (ManagedClassInstance) assemblyImage["PAPA"]["_instance"]["_matchManager"]["<LocalPlayerInfo>k__BackingField"];
-
-                        float LocalMythicPercentile = localPlayerInfo.GetValue<float>("MythicPercentile");
-                        int LocalMythicPlacement = localPlayerInfo.GetValue<int>("MythicPlacement");
-                        int LocalRankingClass = localPlayerInfo.GetValue<int>("RankingClass");
-                        int LocalRankingTier = localPlayerInfo.GetValue<int>("RankingTier");
-
-                        ManagedClassInstance opponentInfo = (ManagedClassInstance) assemblyImage["PAPA"]["_instance"]["_matchManager"]["<OpponentInfo>k__BackingField"];
-
-                        float OpponentMythicPercentile = opponentInfo.GetValue<float>("MythicPercentile");
-                        int OpponentMythicPlacement = opponentInfo.GetValue<int>("MythicPlacement");
-                        int OpponentRankingClass = opponentInfo.GetValue<int>("RankingClass");
-                        int OpponentRankingTier = opponentInfo.GetValue<int>("RankingTier");
-                   
-                        TimeSpan ts = (DateTime.Now - startTime);
-                        responseJSON = $"{{\"matchId\": \"{matchId}\",\"playerRank\":{{\"mythicPercentile\":{LocalMythicPercentile},\"mythicPlacement\":{LocalMythicPlacement},\"class\":{LocalRankingClass},\"tier\":{LocalRankingTier}}},\"opponentRank\":{{\"mythicPercentile\":{OpponentMythicPercentile},\"mythicPlacement\":{OpponentMythicPlacement},\"class\":{OpponentRankingClass},\"tier\":{OpponentRankingTier}}},\"elapsedTime\":{(int)ts.TotalMilliseconds}}}";
-                    }
-                    catch (Exception ex)
-                    {
-                        responseJSON = $"{{\"error\":\"{ex.ToString()}\"}}";
-                    }
+                    responseJSON = matchStateController.HandleRequest();
                 }
                 else if (request.Url.AbsolutePath == "/allcards")
                 {
-                    try
-                    {
-                        DateTime startTime = DateTime.Now;
-                        IAssemblyImage assemblyImage = CreateAssemblyImage();
-                        
-                        string connectionString = assemblyImage["WrapperController"]["<Instance>k__BackingField"]["<CardDatabase>k__BackingField"]["<CardDataProvider>k__BackingField"]["_baseCardDataProvider"]["_dbConnection"]["_connectionString"];
-                        
-                        StringBuilder cardsJSON = new StringBuilder();
-                        cardsJSON.Append("{\"cards\":[");
-                        
-                        using (var connection = new SqliteConnection(connectionString))
-                        {
-                            connection.Open();
-                            
-                            // Get all cards with their titles
-                            var cardsCommand = connection.CreateCommand();
-                            cardsCommand.CommandText = "SELECT c.GrpId, l.Loc as Title FROM Cards c JOIN Localizations_enUS l ON c.TitleId = l.LocId ORDER BY c.GrpId;";
-                            
-                            bool firstCard = true;
-                            using (var reader = cardsCommand.ExecuteReader())
-                            {
-                                while (reader.Read())
-                                {
-                                    if (!firstCard) cardsJSON.Append(",");
-                                    firstCard = false;
-                                    
-                                    int grpId = reader.GetInt32(0);
-                                    string title = reader.IsDBNull(1) ? "" : reader.GetString(1);
-                                    
-                                    cardsJSON.Append($"{{\"grpId\":{grpId},\"title\":\"{JsonEscape(title)}\"}}");
-                                }
-                            }
-                        }
-                        
-                        cardsJSON.Append("]");
-                        
-                        TimeSpan ts = (DateTime.Now - startTime);
-                        cardsJSON.Append($",\"elapsedTime\":{(int)ts.TotalMilliseconds}}}");
-                        responseJSON = cardsJSON.ToString();
-                    }
-                    catch (Exception ex)
-                    {
-                        responseJSON = $"{{\"error\":\"{JsonEscape(ex.ToString())}\"}}";
-                    }
+                    responseJSON = allCardsController.HandleRequest();
                 }
                 else if (request.Url.AbsolutePath.StartsWith("/explore"))
                 {
-                    try
-                    {
-                        DateTime startTime = DateTime.Now;
-                        IAssemblyImage assemblyImage = CreateAssemblyImage();
-                        
-                        // Parse path parameter from query string
-                        string path = request.QueryString["path"] ?? "";
-                        string[] pathParts = string.IsNullOrEmpty(path) ? new string[0] : path.Split('|');
-                        
-                        // Navigate to the specified path
-                        object currentObject = assemblyImage;
-                        string currentPath = "";
-                        
-                        foreach (string part in pathParts)
-                        {
-                            if (!string.IsNullOrEmpty(part))
-                            {
-                                currentObject = GetObjectProperty(currentObject, part);
-                                currentPath += (string.IsNullOrEmpty(currentPath) ? "" : "|") + part;
-                            }
-                        }
-                        
-                        string htmlResponse = GenerateExplorerHTML(currentObject, currentPath, request.Url.Authority);
-                        
-                        TimeSpan ts = (DateTime.Now - startTime);
-                        
-                        // Return HTML instead of JSON for this endpoint
-                        byte[] htmlData = Encoding.UTF8.GetBytes(htmlResponse);
-                        response.AddHeader("Access-Control-Allow-Origin", "*");
-                        response.AddHeader("Access-Control-Allow-Methods", "*");
-                        response.AddHeader("Access-Control-Allow-Headers", "*");
-                        
-                        response.ContentType = "text/html";
-                        response.ContentEncoding = Encoding.UTF8;
-                        response.ContentLength64 = htmlData.LongLength;
-                        
-                        await response.OutputStream.WriteAsync(htmlData, 0, htmlData.Length);
-                        response.Close();
-                        return;
-                    }
-                    catch (Exception ex)
-                    {
-                        responseJSON = $"{{\"error\":\"{JsonEscape(ex.ToString())}\"}}";
-                    }
+                    // Explorer controller handles its own response
+                    bool handled = await explorerController.HandleRequest(request, response);
+                    if (handled) return;
+                    responseJSON = $"{{\"error\":\"Explorer request failed\"}}";
                 }
             }        
 
@@ -370,7 +179,7 @@ namespace MTGATrackerDaemon
             response.Close();
         }
 
-        private object GetObjectProperty(object obj, string propertyName)
+        private object GetObjectPropertyInternal(object obj, string propertyName)
         {
             if (obj == null) return null;
             
@@ -486,7 +295,7 @@ namespace MTGATrackerDaemon
             return null;
         }
 
-        private string GenerateExplorerHTML(object currentObject, string currentPath, string authority)
+        private string GenerateExplorerHTMLInternal(object currentObject, string currentPath, string authority)
         {
             StringBuilder html = new StringBuilder();
             html.Append("<!DOCTYPE html><html><head><title>MTGA Memory Explorer</title>");
@@ -724,6 +533,17 @@ namespace MTGATrackerDaemon
             return fullPath;
         }
 
+        // Public methods for controllers to access
+        public Version GetCurrentVersion() => currentVersion;
+        public bool GetUpdating() => updating;
+        public void SetRunServer(bool value) => runServer = value;
+        public Process GetMTGAProcess() => GetMTGAProcessInternal();
+        public IAssemblyImage CreateAssemblyImage() => CreateAssemblyImageInternal();
+        public string JsonEscape(string text) => JsonEscapeInternal(text);
+        public object GetObjectProperty(object obj, string propertyName) => GetObjectPropertyInternal(obj, propertyName);
+        public string GenerateExplorerHTML(object currentObject, string currentPath, string authority) => GenerateExplorerHTMLInternal(currentObject, currentPath, authority);
+        public bool CheckForUpdates() => CheckForUpdatesInternal();
+
         private string HtmlEscape(string text)
         {
             if (text == null) return "null";
@@ -734,14 +554,14 @@ namespace MTGATrackerDaemon
                       .Replace("'", "&#39;");
         }
 
-        private IAssemblyImage CreateAssemblyImage()
+        private IAssemblyImage CreateAssemblyImageInternal()
         {
-            UnityProcessFacade unityProcess = CreateUnityProcessFacade();
+            UnityProcessFacade unityProcess = CreateUnityProcessFacadeInternal();
             return AssemblyImageFactory.Create(unityProcess, "Core");  
         }
 
 
-        private string JsonEscape(string text)
+        private string JsonEscapeInternal(string text)
         {
             if (text == null) return "null";
             return text.Replace("\\", "\\\\")
@@ -754,9 +574,9 @@ namespace MTGATrackerDaemon
 
     
 
-        private UnityProcessFacade CreateUnityProcessFacade()
+        private UnityProcessFacade CreateUnityProcessFacadeInternal()
         {            
-            Process mtgaProcess = GetMTGAProcess();
+            Process mtgaProcess = GetMTGAProcessInternal();
             if (mtgaProcess == null)
             {
                 return null;
@@ -795,7 +615,7 @@ namespace MTGATrackerDaemon
             return new UnityProcessFacade(processFacade, monoLibraryOffsets);
         }
 
-        private Process GetMTGAProcess()
+        private Process GetMTGAProcessInternal()
         {
             Process[] processes = Process.GetProcesses();
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -830,7 +650,7 @@ namespace MTGATrackerDaemon
             return null;
         }
 
-        private bool CheckForUpdates()
+        private bool CheckForUpdatesInternal()
         {            
             try 
             {
