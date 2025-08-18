@@ -380,7 +380,7 @@ namespace MTGATrackerDaemon
             }
             else if (obj is ITypeDefinition typeDef)
             {
-                // For type definitions, try to get static fields or instance fields
+                // For type definitions, try multiple approaches
                 try
                 {
                     // First try to get as static field value
@@ -388,14 +388,20 @@ namespace MTGATrackerDaemon
                 }
                 catch
                 {
-                    // If that fails, try to find an instance of this class and access the field from it
+                    // Try to find an instance of this class and access the field from it
                     try
                     {
-                        // Look for common singleton patterns
+                        // Look for common singleton patterns (expanded list)
                         object instance = null;
                         
                         // Try to find Instance, _instance, instance fields
-                        var instanceFieldNames = new[] { "Instance", "_instance", "instance", "<Instance>k__BackingField" };
+                        var instanceFieldNames = new[] { 
+                            "Instance", "_instance", "instance", "<Instance>k__BackingField",
+                            "Current", "_current", "current", "<Current>k__BackingField",
+                            "Singleton", "_singleton", "singleton", "<Singleton>k__BackingField",
+                            "Default", "_default", "default", "<Default>k__BackingField"
+                        };
+                        
                         foreach (var instanceFieldName in instanceFieldNames)
                         {
                             try
@@ -414,14 +420,59 @@ namespace MTGATrackerDaemon
                     }
                     catch { }
                     
-                    // If all else fails, return the field definition for info
-                    var field = typeDef.Fields.FirstOrDefault(f => f.Name == propertyName);
-                    return field;
+                    // Try to get the field definition itself - this gives us type info even if we can't access the value
+                    try
+                    {
+                        var field = typeDef.Fields.FirstOrDefault(f => f.Name == propertyName);
+                        if (field != null)
+                        {
+                            return field;
+                        }
+                    }
+                    catch { }
+                    
+                    // Last resort: try direct property access on the type definition
+                    try
+                    {
+                        return typeDef[propertyName];
+                    }
+                    catch { }
                 }
             }
             else if (obj is IManagedObjectInstance managedObj)
             {
-                return managedObj[propertyName];
+                try
+                {
+                    return managedObj[propertyName];
+                }
+                catch
+                {
+                    // If direct access fails, try with GetValue
+                    try
+                    {
+                        return managedObj.GetValue<object>(propertyName);
+                    }
+                    catch
+                    {
+                        // Return the field definition if we can't get the value but the field exists
+                        var field = managedObj.TypeDefinition.Fields.FirstOrDefault(f => f.Name == propertyName);
+                        return field;
+                    }
+                }
+            }
+            else if (obj is IFieldDefinition fieldDef)
+            {
+                // We're at a field definition level - can't navigate further unless it's a static field
+                try
+                {
+                    if (fieldDef.TypeInfo.IsStatic)
+                    {
+                        return fieldDef.DeclaringType.GetStaticValue<object>(fieldDef.Name);
+                    }
+                }
+                catch { }
+                
+                return null;
             }
             else if (obj.GetType().IsArray)
             {
@@ -439,9 +490,10 @@ namespace MTGATrackerDaemon
         {
             StringBuilder html = new StringBuilder();
             html.Append("<!DOCTYPE html><html><head><title>MTGA Memory Explorer</title>");
-            html.Append("<style>body{font-family:Arial,sans-serif;margin:20px;} .path{background:#f0f0f0;padding:10px;margin-bottom:20px;} ");
-            html.Append(".property{margin:5px 0;} .clickable{color:blue;text-decoration:underline;cursor:pointer;} ");
-            html.Append(".value{color:green;} .type{color:gray;font-style:italic;} .back{margin-bottom:20px;}</style></head><body>");
+            html.Append("<style>body{font-family:Arial,sans-serif;margin:20px;line-height:1.4;} .path{background:#f0f0f0;padding:10px;margin-bottom:20px;border-radius:4px;} ");
+            html.Append(".property{margin:3px 0;padding:2px 0;border-bottom:1px dotted #eee;} .clickable{color:#0066cc;text-decoration:underline;cursor:pointer;} .clickable:hover{background:#f0f8ff;} ");
+            html.Append(".value{color:#006600;font-weight:bold;} .type{color:#666;font-style:italic;font-size:0.9em;} .back{margin-bottom:20px;} ");
+            html.Append("strong{color:#333;} .property strong{color:#000080;} h3{color:#333;border-bottom:2px solid #ccc;padding-bottom:5px;}</style></head><body>");
             
             html.Append("<h1>MTGA Memory Explorer</h1>");
             
@@ -462,77 +514,140 @@ namespace MTGATrackerDaemon
             {
                 if (currentObject is IAssemblyImage assemblyImage)
                 {
-                    html.Append("<h3>Assembly Image Properties:</h3>");
+                    html.Append("<h3>object is IAssemblyImage ; Assembly Image Properties:</h3>");
                     foreach (var typeDef in assemblyImage.TypeDefinitions.OrderBy(t => t.Name))
                     {
                         string newPath = string.IsNullOrEmpty(currentPath) ? typeDef.Name : currentPath + "|" + typeDef.Name;
                         html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(newPath)}'>{HtmlEscape(typeDef.Name)}</a> <span class='type'>(Type)</span></div>");
                     }
                 }
-                else if (currentObject is ITypeDefinition typeDefinition)
+                if (currentObject is ITypeDefinition typeDefinition)
                 {
-                    html.Append("<h3>Type Fields:</h3>");
+                    html.Append("<h3>object is ITypeDefinition ; Type Fields:</h3>");
+                    html.Append($"<div class='property'><strong>Type Info:</strong> {HtmlEscape(typeDefinition.FullName)} (Fields: {typeDefinition.Fields.Count})</div>");
+                    html.Append($"<div class='property'><strong>Is Enum:</strong> {typeDefinition.IsEnum}, <strong>Is Value Type:</strong> {typeDefinition.IsValueType}</div>");
+                    html.Append("<br/>");
+                    
                     foreach (var fieldDef in typeDefinition.Fields)
                     {
+                        string newPath = string.IsNullOrEmpty(currentPath) ? fieldDef.Name : currentPath + "|" + fieldDef.Name;
+                        string linkPath = GetSmartNavigationPath(newPath, fieldDef.Name);
+                        
+                        // Enhanced field metadata
+                        string fieldInfo = "";
+                        if (fieldDef.TypeInfo.IsStatic) fieldInfo += " Static";
+                        if (fieldDef.TypeInfo.IsConstant) fieldInfo += " Const";
+                        string typeName = fieldDef.TypeInfo.TryGetTypeDefinition(out var typeDef) ? typeDef.Name : fieldDef.TypeInfo.TypeCode.ToString();
+                        
                         try
                         {
-                            string newPath = string.IsNullOrEmpty(currentPath) ? fieldDef.Name : currentPath + "|" + fieldDef.Name;
+                            // Always show the field as clickable - we'll try to navigate or get value
+                            string fieldDisplay = $"<a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>{HtmlEscape(fieldDef.Name)}</a>";
                             
-                            // Try to determine if this is a static field or instance field
-                            string fieldInfo = fieldDef.TypeInfo.IsStatic ? " (Static)" : " (Instance)";
-                            string typeName = fieldDef.TypeInfo.TryGetTypeDefinition(out var typeDef) ? typeDef.Name : fieldDef.TypeInfo.TypeCode.ToString();
-                            
+                            // Try to get static value if it's a static field
                             if (fieldDef.TypeInfo.IsStatic)
                             {
-                                // For static fields, we can potentially navigate to them
-                                string linkPath = GetSmartNavigationPath(newPath, fieldDef.Name);
-                                html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>{HtmlEscape(fieldDef.Name)}</a> <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span></div>");
+                                try
+                                {
+                                    var staticValue = typeDefinition.GetStaticValue<object>(fieldDef.Name);
+                                    if (staticValue != null)
+                                    {
+                                        string valueStr = staticValue.ToString();
+                                        if (valueStr.Length > 50) valueStr = valueStr.Substring(0, 50) + "...";
+                                        fieldDisplay += $" = <span class='value'>{HtmlEscape(valueStr)}</span>";
+                                        
+                                        if (staticValue is IManagedObjectInstance || staticValue.GetType().IsArray)
+                                        {
+                                            fieldDisplay += $" → {HtmlEscape(staticValue.GetType().Name)}";
+                                        }
+                                    }
+                                }
+                                catch (Exception staticEx)
+                                {
+                                    fieldDisplay += $" <span style='color:orange'>[Static Value Error: {HtmlEscape(staticEx.Message.Split('\n')[0])}]</span>";
+                                }
                             }
-                            else
-                            {
-                                // For instance fields, make them clickable too - we'll try to access them from any available instance
-                                string linkPath = GetSmartNavigationPath(newPath, fieldDef.Name);
-                                html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>{HtmlEscape(fieldDef.Name)}</a> <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span></div>");
-                            }
+                            
+                            html.Append($"<div class='property'>{fieldDisplay} <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span></div>");
                         }
                         catch (Exception ex)
                         {
-                            html.Append($"<div class='property'>{HtmlEscape(fieldDef.Name)}: <span style='color:red'>Error: {HtmlEscape(ex.Message)}</span></div>");
+                            html.Append($"<div class='property'><strong>{HtmlEscape(fieldDef.Name)}</strong>: <span style='color:red'>Error: {HtmlEscape(ex.Message)}</span> <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span></div>");
                         }
                     }
                 }
-                else if (currentObject is IManagedObjectInstance managedObj)
+                if (currentObject is IManagedObjectInstance managedObj)
                 {
-                    html.Append("<h3>Object Properties:</h3>");
+                    html.Append("<h3>object is IManagedObjectInstance ; Object Properties:</h3>");
                     foreach (var fieldDef in managedObj.TypeDefinition.Fields)
                     {
+                        string newPath = string.IsNullOrEmpty(currentPath) ? fieldDef.Name : currentPath + "|" + fieldDef.Name;
+                        string linkPath = GetSmartNavigationPath(newPath, fieldDef.Name);
+                        
+                        // Get field metadata
+                        string fieldInfo = "";
+                        if (fieldDef.TypeInfo.IsStatic) fieldInfo += " Static";
+                        if (fieldDef.TypeInfo.IsConstant) fieldInfo += " Const";
+                        string typeName = fieldDef.TypeInfo.TryGetTypeDefinition(out var typeDef) ? typeDef.Name : fieldDef.TypeInfo.TypeCode.ToString();
+                        
                         try
                         {
                             var value = managedObj[fieldDef.Name];
-                            string newPath = string.IsNullOrEmpty(currentPath) ? fieldDef.Name : currentPath + "|" + fieldDef.Name;
                             
-                            if (value != null && (value is IManagedObjectInstance || value.GetType().IsArray))
+                            // Always show the field, but determine if it should be clickable
+                            bool isNavigable = false;
+                            string valueDisplay = "null";
+                            string valueTypeInfo = "";
+                            
+                            if (value != null)
                             {
-                                string linkPath = GetSmartNavigationPath(newPath, fieldDef.Name);
-                                html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>{HtmlEscape(fieldDef.Name)}</a> <span class='type'>({HtmlEscape(value.GetType().Name)})</span></div>");
+                                // Check if it's navigable (object instance or array)
+                                if (value is IManagedObjectInstance || value.GetType().IsArray)
+                                {
+                                    isNavigable = true;
+                                    valueTypeInfo = $" → {HtmlEscape(value.GetType().Name)}";
+                                    valueDisplay = $"[{HtmlEscape(value.GetType().Name)}]";
+                                }
+                                else
+                                {
+                                    // Show the actual value for primitives/strings
+                                    string valueStr = value.ToString();
+                                    if (valueStr.Length > 100) valueStr = valueStr.Substring(0, 100) + "...";
+                                    valueDisplay = HtmlEscape(valueStr);
+                                }
+                            }
+                            
+                            // Always show field with complete metadata
+                            if (isNavigable)
+                            {
+                                html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>{HtmlEscape(fieldDef.Name)}</a>{valueTypeInfo} <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span></div>");
                             }
                             else
                             {
-                                string valueStr = value?.ToString() ?? "null";
-                                if (valueStr.Length > 100) valueStr = valueStr.Substring(0, 100) + "...";
-                                string typeName = fieldDef.TypeInfo.TryGetTypeDefinition(out var typeDef) ? typeDef.Name : fieldDef.TypeInfo.TypeCode.ToString();
-                                html.Append($"<div class='property'>{HtmlEscape(fieldDef.Name)}: <span class='value'>{HtmlEscape(valueStr)}</span> <span class='type'>({HtmlEscape(typeName)})</span></div>");
+                                html.Append($"<div class='property'><strong>{HtmlEscape(fieldDef.Name)}</strong>: <span class='value'>{valueDisplay}</span> <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span></div>");
                             }
                         }
                         catch (Exception ex)
                         {
-                            html.Append($"<div class='property'>{HtmlEscape(fieldDef.Name)}: <span style='color:red'>Error: {HtmlEscape(ex.Message)}</span></div>");
+                            // Still show the field even if we can't access its value
+                            html.Append($"<div class='property'><strong>{HtmlEscape(fieldDef.Name)}</strong>: <span style='color:orange'>Inaccessible - {HtmlEscape(ex.Message)}</span> <span class='type'>({HtmlEscape(typeName)}{fieldInfo})</span>");
+                            
+                            // Try to make it clickable anyway - sometimes the value access fails but navigation works
+                            try
+                            {
+                                html.Append($" [<a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(linkPath)}'>Try Navigate</a>]");
+                            }
+                            catch
+                            {
+                                // Ignore navigation attempt failure
+                            }
+                            html.Append("</div>");
                         }
                     }
                 }
-                else if (currentObject is IFieldDefinition fieldDefinition)
+                if (currentObject is IFieldDefinition fieldDefinition)
                 {
-                    html.Append("<h3>Field Definition:</h3>");
+                    html.Append("<h3>object is IFieldDefinition ; Field Definition:</h3>");
                     html.Append($"<div class='property'>Name: <span class='value'>{HtmlEscape(fieldDefinition.Name)}</span></div>");
                     string typeName = fieldDefinition.TypeInfo.TryGetTypeDefinition(out var typeDef) ? typeDef.Name : fieldDefinition.TypeInfo.TypeCode.ToString();
                     html.Append($"<div class='property'>Type: <span class='value'>{HtmlEscape(typeName)}</span></div>");
@@ -540,10 +655,10 @@ namespace MTGATrackerDaemon
                     html.Append($"<div class='property'>Is Constant: <span class='value'>{fieldDefinition.TypeInfo.IsConstant}</span></div>");
                     html.Append($"<div class='property'>Declaring Type: <span class='value'>{HtmlEscape(fieldDefinition.DeclaringType.FullName)}</span></div>");
                 }
-                else if (currentObject != null && currentObject.GetType().IsArray)
+                if (currentObject != null && currentObject.GetType().IsArray)
                 {
                     Array array = (Array)currentObject;
-                    html.Append($"<h3>Array Elements (Length: {array.Length}):</h3>");
+                    html.Append($"<h3>object is array ; Array Elements (Length: {array.Length}):</h3>");
                     
                     int maxDisplay = Math.Min(array.Length, 50); // Limit display to first 50 elements
                     for (int i = 0; i < maxDisplay; i++)
@@ -575,41 +690,12 @@ namespace MTGATrackerDaemon
                         html.Append($"<div class='property'><em>... and {array.Length - maxDisplay} more elements</em></div>");
                     }
                 }
-                else
-                {
-                    html.Append($"<div class='property'>Value: <span class='value'>{HtmlEscape(currentObject?.ToString() ?? "null")}</span></div>");
-                    html.Append($"<div class='property'>Type: <span class='type'>{HtmlEscape(currentObject?.GetType().Name ?? "null")}</span></div>");
-                    html.Append($"<div class='property'>Full Type: <span class='type'>{HtmlEscape(currentObject?.GetType().FullName ?? "null")}</span></div>");
-                    
-                    // If it's a managed object instance, try to show its properties
-                    if (currentObject is IManagedObjectInstance debugManagedObj)
-                    {
-                        html.Append("<h3>Debug - Object Properties:</h3>");
-                        foreach (var field in debugManagedObj.TypeDefinition.Fields)
-                        {
-                            try
-                            {
-                                var value = debugManagedObj[field.Name];
-                                string valueStr = value?.ToString() ?? "null";
-                                if (valueStr.Length > 100) valueStr = valueStr.Substring(0, 100) + "...";
-                                string newPath = string.IsNullOrEmpty(currentPath) ? field.Name : currentPath + "|" + field.Name;
-                                
-                                if (value != null && (value is IManagedObjectInstance || value.GetType().IsArray))
-                                {
-                                    html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(newPath)}'>{HtmlEscape(field.Name)}</a> <span class='type'>({HtmlEscape(value.GetType().Name)})</span></div>");
-                                }
-                                else
-                                {
-                                    html.Append($"<div class='property'>{HtmlEscape(field.Name)}: <span class='value'>{HtmlEscape(valueStr)}</span></div>");
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                html.Append($"<div class='property'>{HtmlEscape(field.Name)}: <span style='color:red'>Error: {HtmlEscape(ex.Message)}</span></div>");
-                            }
-                        }
-                    }
-                }
+
+                html.Append($"<h3>Universal properties:</h3>");
+
+                html.Append($"<div class='property'>Value: <span class='value'>{HtmlEscape(currentObject?.ToString() ?? "null")}</span></div>");
+                html.Append($"<div class='property'>Type: <span class='type'>{HtmlEscape(currentObject?.GetType().Name ?? "null")}</span></div>");
+                html.Append($"<div class='property'>Full Type: <span class='type'>{HtmlEscape(currentObject?.GetType().FullName ?? "null")}</span></div>");
             }
             catch (Exception ex)
             {
