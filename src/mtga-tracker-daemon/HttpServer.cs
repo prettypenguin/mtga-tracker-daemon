@@ -463,7 +463,7 @@ namespace MTGATrackerDaemon
                 if (currentObject is IAssemblyImage assemblyImage)
                 {
                     html.Append("<h3>Assembly Image Properties:</h3>");
-                    foreach (var typeDef in assemblyImage.TypeDefinitions)
+                    foreach (var typeDef in assemblyImage.TypeDefinitions.OrderBy(t => t.Name))
                     {
                         string newPath = string.IsNullOrEmpty(currentPath) ? typeDef.Name : currentPath + "|" + typeDef.Name;
                         html.Append($"<div class='property'><a class='clickable' href='http://{authority}/explore?path={Uri.EscapeDataString(newPath)}'>{HtmlEscape(typeDef.Name)}</a> <span class='type'>(Type)</span></div>");
