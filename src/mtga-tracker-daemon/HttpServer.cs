@@ -151,7 +151,7 @@ namespace MTGATrackerDaemon
                 {
                     responseJSON = matchStateController.HandleRequest();
                 }
-                else if (request.Url.AbsolutePath == "/allcards")
+                else if (request.Url.AbsolutePath == "/allCards")
                 {
                     responseJSON = allCardsController.HandleRequest();
                 }

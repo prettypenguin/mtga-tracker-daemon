@@ -22,6 +22,10 @@ namespace MTGATrackerDaemon.Controllers
                 IAssemblyImage assemblyImage = _server.CreateAssemblyImage();
                 
                 string connectionString = assemblyImage["WrapperController"]["<Instance>k__BackingField"]["<CardDatabase>k__BackingField"]["<CardDataProvider>k__BackingField"]["_baseCardDataProvider"]["_dbConnection"]["_connectionString"];
+
+                // Fix Steam version path issues
+                connectionString = connectionString.Replace("Data Source=Z:", "Data Source=");
+                connectionString = connectionString.Replace("\\", "/");
                 
                 StringBuilder cardsJSON = new StringBuilder();
                 cardsJSON.Append("{\"cards\":[");
